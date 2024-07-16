@@ -18,11 +18,10 @@ class ChessEnv(gym.Env):
         self.board = chess.Board()
         self.action_space = spaces.Discrete(4672)
         self.observation_space = spaces.Box(low=0, high=1, shape=(8, 8, 13), dtype=np.float32)
+        self.engine_path = "/opt/homebrew/Cellar/stockfish/16.1/bin/stockfish" #你的stockfish地址
 
     def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None) -> Tuple[np.ndarray, Dict]:
         super().reset(seed=seed)
-        if seed is not None:
-            self.np_random, seed = gym.utils.seeding.np_random(seed)
         self.board.reset()
         self.last_opponent_move = None
         return self._get_obs(), {}
@@ -60,22 +59,21 @@ class ChessEnv(gym.Env):
             piece = self.board.piece_at(move.to_square)
             reward = 0.1
             if piece:
-                if piece.piece_type == chess.QUEEN:
-                    reward += 9.0
-                elif piece.piece_type == chess.ROOK:
-                    reward += 5.0
-                elif piece.piece_type in {chess.BISHOP, chess.KNIGHT}:
-                    reward += 3.0
-                elif piece.piece_type == chess.PAWN:
-                    reward += 1.0
-        center_squares = [chess.E4, chess.D4, chess.E5, chess.D5]
-        if move.to_square in center_squares:
+                piece_values = {
+                    chess.QUEEN: 9.0,
+                    chess.ROOK: 5.0,
+                    chess.BISHOP: 3.0,
+                    chess.KNIGHT: 3.0,
+                    chess.PAWN: 1.0
+                }
+                reward += piece_values.get(piece.piece_type, 0)
+        if move.to_square in [chess.E4, chess.D4, chess.E5, chess.D5]:
             reward += 0.5
         reward -= 0.01 * self.board.fullmove_number
         return reward
 
     def stockfish_move(self) -> Optional[chess.Move]:
-        with chess.engine.SimpleEngine.popen_uci("/opt/homebrew/Cellar/stockfish/16.1/bin/stockfish") as engine:
+        with chess.engine.SimpleEngine.popen_uci(self.engine_path) as engine:
             result = engine.play(self.board, chess.engine.Limit(time=0.1))
             return result.move
 
@@ -115,14 +113,7 @@ def get_obs(board: chess.Board, last_opponent_move: Optional[chess.Move]) -> np.
     for i in range(64):
         piece = board.piece_at(i)
         if piece:
-            plane_index = {
-                chess.PAWN: 0,
-                chess.KNIGHT: 1,
-                chess.BISHOP: 2,
-                chess.ROOK: 3,
-                chess.QUEEN: 4,
-                chess.KING: 5
-            }[piece.piece_type] + (6 if piece.color == chess.BLACK else 0)
+            plane_index = piece.piece_type - 1 + (6 if piece.color == chess.BLACK else 0)
             board_planes[i // 8, i % 8, plane_index] = 1
     if last_opponent_move:
         from_square = last_opponent_move.from_square
@@ -178,7 +169,7 @@ def evaluate_model(model: PPO, episodes: int = 100) -> None:
     print(f"Losses: {losses}")
 
 def stockfish_move(board: chess.Board) -> Optional[chess.Move]:
-    with chess.engine.SimpleEngine.popen_uci("/opt/homebrew/Cellar/stockfish/16.1/bin/stockfish") as engine:
+    with chess.engine.SimpleEngine.popen_uci("/opt/homebrew/Cellar/stockfish/16.1/bin/stockfish") as engine: #你的stockfish地址
         result = engine.play(board, chess.engine.Limit(time=0.1))
         return result.move
 
@@ -189,19 +180,19 @@ policy_kwargs = dict(
 
 # 创建和包装环境
 env = ChessEnv()
-env = Monitor(env)  # 使用 Monitor 包装环境
+env = Monitor(env)
 obs, _ = env.reset()
-print(obs.shape)  # 应输出 (8, 8, 13)
+print(obs.shape)
 
 model = PPO('CnnPolicy', env, verbose=1, policy_kwargs=policy_kwargs, learning_rate=0.0001, n_steps=2048, ent_coef=0.01)
 
 # 定义早停回调
 stop_callback = StopTrainingOnNoModelImprovement(max_no_improvement_evals=5, verbose=1)
 eval_env = ChessEnv()
-eval_env = Monitor(eval_env)  # 使用 Monitor 包装评估环境
+eval_env = Monitor(eval_env)
 eval_callback = EvalCallback(eval_env, callback_on_new_best=stop_callback, eval_freq=10000, best_model_save_path='./logs/', verbose=1)
 
-model.learn(total_timesteps=2000000, callback=eval_callback)  # 增加训练步数
+model.learn(total_timesteps=2000000, callback=eval_callback)
 
 # 保存模型
 model.save("chess_model")
