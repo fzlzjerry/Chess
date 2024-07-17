@@ -1,0 +1,1 @@
+### If you want to train the model on Windows or Linux, you need to download Stockfish from this website: [Stockfish Download](https://stockfishchess.org/download/), and change the file path in `main.py`.
