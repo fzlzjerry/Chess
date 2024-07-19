@@ -9,13 +9,14 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import torch as th
 import torch.nn as nn
+import torch.multiprocessing as mp
+import torch.distributed as dist
 import random
 from typing import Optional, Tuple, Dict, Any
 import os
 
 # 设置可见的GPU
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
-
 
 class ChessEnv(gym.Env):
     def __init__(self):
@@ -100,16 +101,11 @@ class ChessEnv(gym.Env):
 
 
 class CustomCNN(BaseFeaturesExtractor):
-    def __init__(self, observation_space: spaces.Box, features_dim: int = 512):
+    def __init__(self, observation_space: spaces.Box, features_dim: int = 1024):
         super(CustomCNN, self).__init__(observation_space, features_dim)
         n_input_channels = observation_space.shape[2]
         self.cnn = nn.Sequential(
-            nn.Conv2d(n_input_channels, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            ResidualBlock(64),
-            ResidualBlock(64),
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(n_input_channels, 128, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
             ResidualBlock(128),
@@ -120,6 +116,11 @@ class CustomCNN(BaseFeaturesExtractor):
             ResidualBlock(256),
             ResidualBlock(256),
             nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            ResidualBlock(512),
+            ResidualBlock(512),
+            nn.Conv2d(512, 1024, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.Flatten()
         )
@@ -241,13 +242,19 @@ class CustomStopTrainingOnNoModelImprovement(StopTrainingOnNoModelImprovement):
                 f"No improvement for {self.num_no_improvement_evals} evaluations. Patience left: {self.max_no_improvement_evals - self.num_no_improvement_evals}")
         return result
 
+def init_process(rank, size, backend='nccl'):
+    """ Initialize the distributed environment. """
+    os.environ['MASTER_ADDR'] = '127.0.0.1'
+    os.environ['MASTER_PORT'] = '29500'
+    dist.init_process_group(backend, rank=rank, world_size=size)
 
-if __name__ == '__main__':
+def run(rank, size):
+    init_process(rank, size)
+    
     policy_kwargs = dict(
         features_extractor_class=CustomCNN,
-        features_extractor_kwargs=dict(features_dim=512),
+        features_extractor_kwargs=dict(features_dim=1024),
     )
-
 
     # 创建和包装环境
     def make_env():
@@ -258,27 +265,31 @@ if __name__ == '__main__':
 
         return _init
 
-
     num_cpu = 4  # 使用四个CPU
     from stable_baselines3.common.vec_env import SubprocVecEnv
 
     env = SubprocVecEnv([make_env() for _ in range(num_cpu)])
 
     # 初始化模型
-    model = PPO('CnnPolicy', env, verbose=1, policy_kwargs=policy_kwargs, learning_rate=0.0001, n_steps=2048,
-                ent_coef=0.01, device='cuda')
+    model = PPO('CnnPolicy', env, verbose=1, policy_kwargs=policy_kwargs, learning_rate=0.0001, n_steps=4096,
+                ent_coef=0.01, device=f'cuda:{rank}')
 
     # 定义早停回调
     stop_callback = CustomStopTrainingOnNoModelImprovement(max_no_improvement_evals=10, verbose=1)
     eval_env = ChessEnv()
     eval_env = Monitor(eval_env)
-    eval_callback = EvalCallback(eval_env, callback_on_new_best=stop_callback, eval_freq=10000,
+    eval_callback = EvalCallback(eval_env, callback_on_new_best=stop_callback, eval_freq=20000,
                                  best_model_save_path='./logs/', verbose=1)
 
-    model.learn(total_timesteps=2000000, callback=eval_callback)
+    model.learn(total_timesteps=10000000, callback=eval_callback)
 
     # 保存模型
     model.save("chess_model")
 
     # 评估模型
     evaluate_model(model, episodes=100)
+
+
+if __name__ == '__main__':
+    size = 4  # Number of GPUs
+    mp.spawn(run, args=(size,), nprocs=size, join=True)
