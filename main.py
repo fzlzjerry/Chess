@@ -9,8 +9,14 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 import torch as th
 import torch.nn as nn
+import torch.multiprocessing as mp
+import torch.distributed as dist
 import random
 from typing import Optional, Tuple, Dict, Any
+import os
+
+# 设置可见的GPU
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 
 
 class ChessEnv(gym.Env):
@@ -19,7 +25,7 @@ class ChessEnv(gym.Env):
         self.board = chess.Board()
         self.action_space = spaces.Discrete(4672)
         self.observation_space = spaces.Box(low=0, high=1, shape=(8, 8, 13), dtype=np.float32)
-        self.engine_path = "/opt/homebrew/Cellar/stockfish/16.1/bin/stockfish"  # 确保路径正确
+        self.engine_path = "/usr/bin/stockfish"  # 更新路径
 
     def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None) -> Tuple[np.ndarray, Dict]:
         super().reset(seed=seed)
@@ -96,16 +102,11 @@ class ChessEnv(gym.Env):
 
 
 class CustomCNN(BaseFeaturesExtractor):
-    def __init__(self, observation_space: spaces.Box, features_dim: int = 512):
+    def __init__(self, observation_space: spaces.Box, features_dim: int = 1024):
         super(CustomCNN, self).__init__(observation_space, features_dim)
         n_input_channels = observation_space.shape[2]
         self.cnn = nn.Sequential(
-            nn.Conv2d(n_input_channels, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            ResidualBlock(64),
-            ResidualBlock(64),
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(n_input_channels, 128, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
             ResidualBlock(128),
@@ -117,10 +118,16 @@ class CustomCNN(BaseFeaturesExtractor):
             ResidualBlock(256),
             nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            ResidualBlock(512),
+            ResidualBlock(512),
+            nn.Conv2d(512, 1024, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
             nn.Flatten()
         )
         with th.no_grad():
-            sample_input = th.zeros(1, n_input_channels, observation_space.shape[0], observation_space.shape[1])
+            sample_input = th.zeros(8, n_input_channels, observation_space.shape[0],
+                                    observation_space.shape[1])  # 使用批次大小为8
             n_flatten = self.cnn(sample_input).shape[1]
         self.linear = nn.Sequential(
             nn.Linear(n_flatten, features_dim),
@@ -180,7 +187,7 @@ def random_move(board: chess.Board) -> Optional[chess.Move]:
 
 
 def stockfish_move(board: chess.Board) -> Optional[chess.Move]:
-    with chess.engine.SimpleEngine.popen_uci("/opt/homebrew/Cellar/stockfish/16.1/bin/stockfish") as engine:  # 确保路径正确
+    with chess.engine.SimpleEngine.popen_uci("/usr/bin/stockfish") as engine:  # 确保路径正确
         result = engine.play(board, chess.engine.Limit(time=0.1))
         return result.move
 
@@ -195,7 +202,7 @@ def evaluate_model(model: PPO, episodes: int = 100) -> None:
         while not done:
             if board.turn == chess.WHITE:
                 obs = get_obs(board, last_opponent_move)[None]
-                obs = th.tensor(obs).float()
+                obs = th.tensor(obs).float().to('cuda:0')  # 使用第一个GPU
                 action, _ = model.predict(obs, deterministic=True)
                 move = get_move_from_action(board, action[0])
             else:
@@ -224,30 +231,68 @@ def evaluate_model(model: PPO, episodes: int = 100) -> None:
     print(f"Losses: {losses}")
 
 
-policy_kwargs = dict(
-    features_extractor_class=CustomCNN,
-    features_extractor_kwargs=dict(features_dim=512),
-)
+class CustomStopTrainingOnNoModelImprovement(StopTrainingOnNoModelImprovement):
+    def __init__(self, max_no_improvement_evals: int = 10, min_evals: int = 0, verbose: int = 0):
+        super().__init__(max_no_improvement_evals, min_evals, verbose)
+        self.num_no_improvement_evals = 0
 
-# 创建和包装环境
-env = ChessEnv()
-env = Monitor(env)
-obs, _ = env.reset()
-print(obs.shape)
+    def _on_step(self) -> bool:
+        result = super()._on_step()
+        if self.num_no_improvement_evals > 0:
+            print(
+                f"No improvement for {self.num_no_improvement_evals} evaluations. Patience left: {self.max_no_improvement_evals - self.num_no_improvement_evals}")
+        return result
 
-model = PPO('CnnPolicy', env, verbose=1, policy_kwargs=policy_kwargs, learning_rate=0.0001, n_steps=2048, ent_coef=0.01)
 
-# 定义早停回调
-stop_callback = StopTrainingOnNoModelImprovement(max_no_improvement_evals=5, verbose=1)
-eval_env = ChessEnv()
-eval_env = Monitor(eval_env)
-eval_callback = EvalCallback(eval_env, callback_on_new_best=stop_callback, eval_freq=10000,
-                             best_model_save_path='./logs/', verbose=1)
+def init_process(rank, size, backend='nccl'):
+    """ Initialize the distributed environment. """
+    os.environ['MASTER_ADDR'] = '127.0.0.1'
+    os.environ['MASTER_PORT'] = '29500'
+    dist.init_process_group(backend, rank=rank, world_size=size)
 
-model.learn(total_timesteps=2000000, callback=eval_callback)
 
-# 保存模型
-model.save("chess_model")
+def run(rank, size):
+    init_process(rank, size)
 
-# 评估模型
-evaluate_model(model, episodes=100)
+    policy_kwargs = dict(
+        features_extractor_class=CustomCNN,
+        features_extractor_kwargs=dict(features_dim=1024),
+    )
+
+    # 创建和包装环境
+    def make_env():
+        def _init():
+            env = ChessEnv()
+            env = Monitor(env)
+            return env
+
+        return _init
+
+    num_cpu = 4  # 使用四个CPU
+    from stable_baselines3.common.vec_env import SubprocVecEnv
+
+    env = SubprocVecEnv([make_env() for _ in range(num_cpu)])
+
+    # 初始化模型
+    model = PPO('CnnPolicy', env, verbose=1, policy_kwargs=policy_kwargs, learning_rate=0.0001, n_steps=4096,
+                ent_coef=0.01, device=f'cuda:{rank}')
+
+    # 定义早停回调
+    stop_callback = CustomStopTrainingOnNoModelImprovement(max_no_improvement_evals=10, verbose=1)
+    eval_env = ChessEnv()
+    eval_env = Monitor(eval_env)
+    eval_callback = EvalCallback(eval_env, callback_on_new_best=stop_callback, eval_freq=20000,
+                                 best_model_save_path='./logs/', verbose=1)
+
+    model.learn(total_timesteps=10000000, callback=eval_callback)
+
+    # 保存模型
+    model.save("chess_model")
+
+    # 评估模型
+    evaluate_model(model, episodes=100)
+
+
+if __name__ == '__main__':
+    size = 4  # Number of GPUs
+    mp.spawn(run, args=(size,), nprocs=size, join=True)
